@@ -5158,6 +5158,7 @@ async def entity_batch_create(
     """
     b = _backend(ctx)
     results = []
+    row_index: list[int] = []
     errors = []
     total = len(entities)
     await ctx.info(f"Batch creating {total} entities")
@@ -5192,11 +5193,12 @@ async def entity_batch_create(
         try:
             info = await creator(**ent_def)
             results.append(info)
+            row_index.append(i)
         except Exception as exc:
             errors.append({"index": i, "type": ent_type, "error": str(exc)})
 
     await ctx.report_progress(total, total)
-    return {
+    reply = {
         "created": len(results),
         "errors": errors,
         "entities": _shape_rows(
@@ -5208,6 +5210,11 @@ async def entity_batch_create(
             total=len(results),
         ),
     }
+    # A failed item has no row, so after any error row k is no longer input k.
+    # row_index[k] names the input each row came from.
+    if errors:
+        reply["row_index"] = row_index
+    return reply
 
 
 @cad_tool(
@@ -6124,8 +6131,21 @@ async def titleblock_apply_iso_a3(
     sheet: Annotated[str, Field(default="1/1")] = "1/1",
     revision: Annotated[str, Field(default="A")] = "A",
     company: Annotated[str, Field(default="Anka-Makine")] = "Anka-Makine",
-    origin_x: Annotated[float, Field(default=0.0)] = 0.0,
-    origin_y: Annotated[float, Field(default=0.0)] = 0.0,
+    origin_x: Annotated[
+        float | None,
+        Field(
+            default=None,
+            description="Lower-left corner of the sheet. Default: 0, or on a layout "
+            "the paper's own corner (minus the page setup's left margin).",
+        ),
+    ] = None,
+    origin_y: Annotated[
+        float | None,
+        Field(
+            default=None,
+            description="Default: 0, or on a layout minus the page setup's bottom margin.",
+        ),
+    ] = None,
     layout: Annotated[
         str,
         "Paper-space layout to draw the sheet on (create it with layout_create). "
@@ -6139,6 +6159,12 @@ async def titleblock_apply_iso_a3(
     title block belongs — the border frames the printed sheet, not the model.
     Your current space is restored afterwards, so asking for a border does not
     move you onto the sheet.
+
+    On a layout, paper-space (0, 0) is the corner of the *printable area*, as
+    in AutoCAD, not the corner of the paper. A frame drawn at (0, 0) therefore
+    sat 7.5 mm right and 20 mm up on an A3 "DWG To PDF" sheet and ran off the
+    top and right edges. With no origin given, the frame now starts at the
+    paper's corner, (-left margin, -bottom margin).
     """
     from engineering import TitleBlockMetadata, apply_iso_a3_titleblock
 
@@ -6157,12 +6183,33 @@ async def titleblock_apply_iso_a3(
         revision=revision,
         company=company,
     )
+    if origin_x is None or origin_y is None:
+        margin_x, margin_y = _layout_paper_corner(backend, layout)
+        origin_x = margin_x if origin_x is None else origin_x
+        origin_y = margin_y if origin_y is None else origin_y
     return await apply_iso_a3_titleblock(
         backend,
         metadata=metadata,
         origin=(origin_x, origin_y),
         layout=layout or None,
     )
+
+
+def _layout_paper_corner(backend, layout: str) -> tuple[float, float]:
+    """Paper-space position of the paper's lower-left corner on `layout`.
+
+    (0, 0) without a layout, or when the engine keeps no page setup (COM
+    reads the margins from the live plot device, not from the file).
+    """
+    if not layout:
+        return 0.0, 0.0
+    try:
+        doc = backend._require_doc()
+        dxf = doc.layouts.get(layout).dxf_layout.dxf
+        unit = 25.4 if int(dxf.plot_paper_units) == 0 else 1.0
+        return -float(dxf.left_margin) / unit, -float(dxf.bottom_margin) / unit
+    except Exception:  # noqa: BLE001 - no page setup to read: keep the old origin
+        return 0.0, 0.0
 
 
 @cad_tool(

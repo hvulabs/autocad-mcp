@@ -257,8 +257,17 @@ def _run_libredwg(tool: str, args: list[str]) -> subprocess.CompletedProcess:
         raise RuntimeError(f"LibreDWG {tool} is not installed here")
     # LibreDWG exits non-zero on recoverable warnings too, so the caller judges
     # success by the output file, and only quotes stderr when it is missing.
+    # LibreDWG echoes drawing strings in their own codepage (a cp1252 "»" for
+    # 0xBB was seen), so a strict UTF-8 decode turned a successful write into
+    # a UnicodeDecodeError. The output is only quoted, never parsed.
     return subprocess.run(
-        [exe, *args], capture_output=True, text=True, timeout=LIBREDWG_TIMEOUT_S, check=False
+        [exe, *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=LIBREDWG_TIMEOUT_S,
+        check=False,
     )
 
 
@@ -326,7 +335,7 @@ def _write_dwg(doc, path: str, version: str = "R2018") -> dict:
     produced = version if version in LIBREDWG_WRITE_VERSIONS else "R2000"
     with tempfile.TemporaryDirectory(prefix="acadmcp-dwg-") as tmp:
         dxf = Path(tmp) / "out.dxf"
-        doc.saveas(str(dxf))
+        _write_dwg_ready_dxf(doc, dxf)
         out = Path(path)
         if out.exists():
             out.unlink()
@@ -335,7 +344,139 @@ def _write_dwg(doc, path: str, version: str = "R2018") -> dict:
             raise RuntimeError(
                 f"dxf2dwg could not write '{path}': {(proc.stderr or proc.stdout)[-400:]}"
             )
-    return {"writer": "libredwg", "version": produced, "requested_version": version}
+    result = {"writer": "libredwg", "version": produced, "requested_version": version}
+    result.update(_verify_dwg(doc, out))
+    return result
+
+
+def _mtext_rotation_to_direction(doc) -> int:
+    """Re-express every MTEXT ``rotation`` (code 50) as a ``text_direction``.
+
+    ezdxf renders a rotated dimension text (a vertical DIMLINEAR) as MTEXT
+    with code 50, which LibreDWG's DXF reader rejects ("Invalid DXF code 50
+    for MTEXT"). Both encode the same angle; the direction vector is the
+    form every reader accepts. Returns how many entities were changed.
+    """
+    changed = 0
+    spaces = [doc.modelspace(), *(doc.layouts.get(n) for n in doc.layouts.names() if n != "Model")]
+    for space in [*spaces, *doc.blocks]:
+        for entity in space:
+            if entity.dxftype() == "MTEXT" and entity.dxf.hasattr("rotation"):
+                angle = math.radians(entity.dxf.rotation)
+                entity.dxf.text_direction = (math.cos(angle), math.sin(angle), 0.0)
+                entity.dxf.discard("rotation")
+                changed += 1
+    return changed
+
+
+def _write_dwg_ready_dxf(doc, dxf: Path) -> None:
+    """Write a copy of `doc` as the DXF LibreDWG converts faithfully.
+
+    The live document is never touched: it is saved, re-read, fixed and
+    saved again. The copy is written as DXF R2000, the version the DWG is
+    written in, so ezdxf (not LibreDWG) does the down-conversion, including
+    encoding non-ANSI characters as \\U+XXXX, which AutoCAD reads back as
+    the original text. Measured with LibreDWG 0.13.3 on an R2010 DXF: layer,
+    block and layout names were cut to one character and model space came out
+    empty; with an R2000 DXF names survived but 20 of 21 dimensions were lost.
+    LibreDWG 0.14 is required as well (see the Dockerfile).
+    """
+    import ezdxf
+
+    doc.saveas(str(dxf))
+    copy = ezdxf.readfile(str(dxf))
+    _mtext_rotation_to_direction(copy)
+    copy.dxfversion = "AC1015"
+    copy.saveas(str(dxf))
+
+
+def _verify_dwg(doc, out: Path) -> dict:
+    """Read the written DWG back and compare model-space entity counts.
+
+    dxf2dwg exits 0 and reports success on files that have lost most of
+    their content, so the only trustworthy check is to open the result.
+    Raises when content is missing; skipped (and said so) without dwg2dxf.
+    """
+    if _libredwg_tool("dwg2dxf") is None:
+        return {"verified": False, "verify_note": "dwg2dxf not installed; output not read back"}
+    from collections import Counter
+
+    # Count by iterating, not len(): the recover pass deletes entities it
+    # cannot repair (LibreDWG 0.13.3 dimensions) but len() still counts them.
+    expected = Counter(e.dxftype() for e in doc.modelspace())
+    try:
+        back = _read_dwg(str(out))
+    except Exception as exc:  # noqa: BLE001 - any read failure means a bad file
+        raise RuntimeError(f"DWG written to '{out}' cannot be read back: {exc}") from exc
+    found = Counter(e.dxftype() for e in back.modelspace())
+    missing = {kind: n - found.get(kind, 0) for kind, n in expected.items() if found.get(kind, 0) < n}
+    layers = {layer.dxf.name for layer in doc.layers}
+    lost_layers = sorted(layers - {layer.dxf.name for layer in back.layers})
+    if missing or lost_layers:
+        raise RuntimeError(
+            f"DWG written to '{out}' is incomplete after reading it back: missing "
+            f"{missing or 'no entities'}, layers lost or renamed {lost_layers or 'none'}. "
+            "LibreDWG older than 0.14 drops dimensions and truncates names; upgrade it."
+        )
+    return {"verified": True, "entities": sum(found.values())}
+
+
+def _ensure_render_fonts() -> str:
+    """Make sure ezdxf has a real TrueType font to draw text with.
+
+    With no font installed (the python:slim image has none) ezdxf falls back
+    to MonospaceFont, which draws every character as an empty box: the
+    "text as boxes" PDFs. matplotlib always ships DejaVu Sans, which covers
+    Vietnamese and French, so when the system has no usable font that folder
+    is added to ezdxf's font cache. Returns "system", "matplotlib" or "none".
+    """
+    from ezdxf.fonts import fonts
+    from ezdxf.fonts.font_manager import DEFAULT_FONTS
+
+    def usable() -> bool:
+        return any(fonts.font_manager.has_font(name) for name in DEFAULT_FONTS)
+
+    if usable():
+        return "system"
+    try:
+        import matplotlib
+
+        bundled = Path(matplotlib.get_data_path()) / "fonts" / "ttf"
+        fonts.font_manager.build([str(bundled)], support_dirs=False)
+        # fallback_font_name() remembers its answer, including the missing
+        # font it settled on while nothing was installed; forget it.
+        if hasattr(fonts.font_manager, "_fallback_font_name"):
+            fonts.font_manager._fallback_font_name = ""
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not add matplotlib fonts to ezdxf: %s", exc)
+    return "matplotlib" if usable() else "none"
+
+
+def _print_config(target):
+    """Render settings for a printed sheet: paper-white, and black ink when
+    the layout plots with monochrome.ctb (what page_setup_apply sets).
+
+    Without this the renderer used its screen defaults: dark background for
+    model space and layer colours on paper.
+    """
+    from ezdxf.addons.drawing.config import (
+        BackgroundPolicy,
+        ColorPolicy,
+        Configuration,
+        LineweightPolicy,
+    )
+
+    ctb = ""
+    try:
+        ctb = str(target.dxf_layout.dxf.get("current_style_sheet", "") or "")
+    except Exception:  # noqa: BLE001 - model space has no plot settings here
+        ctb = ""
+    return Configuration(
+        background_policy=BackgroundPolicy.WHITE,
+        color_policy=ColorPolicy.BLACK if "monochrome" in ctb.lower() else ColorPolicy.COLOR,
+        lineweight_policy=LineweightPolicy.ABSOLUTE,
+        min_lineweight=0.13,
+    )
 
 
 def _image_pixels(path: str) -> tuple[int, int]:
@@ -2790,17 +2931,20 @@ class EzdxfBackend(AutoCADBackend):
                 paper = None
                 if resolved is not None and resolved != "Model":
                     paper = self._paper_frame(target)
+                fonts = _ensure_render_fonts()
                 fig = _new_agg_figure(figsize=paper["figsize"] if paper else None)
                 ax = fig.add_axes([0, 0, 1, 1])
                 ctx = RenderContext(doc)
                 out = MatplotlibBackend(ax, adjust_figure=paper is None)
-                Frontend(ctx, out).draw_layout(target, finalize=True)
+                Frontend(ctx, out, config=_print_config(target)).draw_layout(
+                    target, finalize=True
+                )
                 if paper is not None:
                     ax.set_xlim(*paper["xlim"])
                     ax.set_ylim(*paper["ylim"])
                     ax.set_aspect("equal", adjustable="box")
                 fig.savefig(path, dpi=150)
-                result = {"ok": True, "path": path}
+                result = {"ok": True, "path": path, "fonts": fonts}
                 if paper is not None:
                     result["paper_mm"] = paper["size_mm"]
                     result["scale"] = paper["scale"]
