@@ -524,6 +524,15 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
         acad=("DXFOUT",),
         synonyms=("export dxf", "save as dxf", "interchange file", "dxf output"),
     ),
+    "file_upload": ToolAliases(
+        synonyms=("upload file", "send drawing to server", "put file", "import dwg file"),
+    ),
+    "file_download": ToolAliases(
+        synonyms=("download file", "get file back", "retrieve output", "fetch pdf"),
+    ),
+    "file_list": ToolAliases(
+        synonyms=("list files", "list drawings", "what files are on the server", "dir"),
+    ),
     "drawing_export_pdf": ToolAliases(
         acad=("PLOT", "PRINT", "EXPORTPDF"),
         synonyms=("print", "plot", "export pdf", "pdf output", "paper copy"),

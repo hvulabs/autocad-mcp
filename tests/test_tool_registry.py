@@ -495,7 +495,7 @@ async def test_tool_groups_is_byte_identical_to_the_source_declared_grouping():
 
 
 async def test_tool_group_sizes_are_unchanged():
-    """Frozen snapshot of the surface (247 tools, 28 groups).
+    """Frozen snapshot of the surface (250 tools, 28 groups).
 
     Taken before @cad_tool landed at 131 tools; `batch` moved 2 -> 3 when
     v1.5.0's `cad_batch` joined `entity_batch_create`/`entity_batch_modify`, and
@@ -610,7 +610,7 @@ async def test_tool_group_sizes_are_unchanged():
         "blocks": 9,
         "corner_ops": 4,
         "dimensions": 5,
-        "drawing": 11,
+        "drawing": 14,
         "engineering": 10,
         "entity_creation": 18,
         "entity_modification": 16,
@@ -633,4 +633,4 @@ async def test_tool_group_sizes_are_unchanged():
         "validation": 1,
         "view": 4,
     }
-    assert sum(sizes.values()) == 247
+    assert sum(sizes.values()) == 250

@@ -16,6 +16,8 @@ import io
 import logging
 import math
 import os
+import shutil
+import subprocess
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -173,7 +175,8 @@ except ImportError:
 _DWG_WRITE_REFUSAL = (
     "{operation}: the headless ezdxf backend cannot write DWG. ezdxf has no DWG "
     "writer, and writing DXF bytes to '{path}' would produce a file AutoCAD "
-    "refuses or misreads. Save with a .dxf extension instead, or switch to the "
+    "refuses or misreads. Install LibreDWG (dxf2dwg) or the ODA File Converter "
+    "on the server, save with a .dxf extension instead, or switch to the "
     "live COM backend (AUTOCAD_MCP_BACKEND=com, needs Windows + AutoCAD) for "
     "real DWG output."
 )
@@ -215,6 +218,124 @@ def _odafc_available() -> bool:
         return bool(odafc.is_installed())
     except Exception:  # noqa: BLE001 - an import failure is simply "not installed"
         return False
+
+
+# LibreDWG is the second DWG route, after the ODA File Converter. It is free
+# software and packages cleanly into a Linux image, which the ODA converter
+# (a licensed AppImage) does not. Its writer covers R2000/R2004 only, so a
+# write through it reports the version it actually produced rather than the
+# one asked for. LIBREDWG_BIN pins a directory; otherwise PATH is searched.
+LIBREDWG_WRITE_VERSIONS = ("R2000", "R2004")
+LIBREDWG_TIMEOUT_S = 300
+
+
+def _libredwg_tool(name: str) -> str | None:
+    pinned = os.environ.get("LIBREDWG_BIN", "").strip()
+    if pinned:
+        candidate = Path(pinned) / name
+        return str(candidate) if candidate.is_file() and os.access(candidate, os.X_OK) else None
+    return shutil.which(name)
+
+
+def _dwg_reader() -> str | None:
+    """Which converter can read a DWG here: 'odafc', 'libredwg' or None."""
+    if _odafc_available():
+        return "odafc"
+    return "libredwg" if _libredwg_tool("dwg2dxf") else None
+
+
+def _dwg_writer() -> str | None:
+    """Which converter can write a DWG here: 'odafc', 'libredwg' or None."""
+    if _odafc_available():
+        return "odafc"
+    return "libredwg" if _libredwg_tool("dxf2dwg") else None
+
+
+def _run_libredwg(tool: str, args: list[str]) -> subprocess.CompletedProcess:
+    exe = _libredwg_tool(tool)
+    if exe is None:
+        raise RuntimeError(f"LibreDWG {tool} is not installed here")
+    # LibreDWG exits non-zero on recoverable warnings too, so the caller judges
+    # success by the output file, and only quotes stderr when it is missing.
+    return subprocess.run(
+        [exe, *args], capture_output=True, text=True, timeout=LIBREDWG_TIMEOUT_S, check=False
+    )
+
+
+def _drop_null_handles(dxf: Path) -> None:
+    """Remove `5 / 0` handle pairs from a dwg2dxf output, in place.
+
+    LibreDWG writes some objects (seen: the ENDBLK of a layout block in a DWG
+    that LibreDWG itself produced) with handle 0, which ezdxf refuses even in
+    recover mode. Without the pair the object is simply assigned a fresh
+    handle on load.
+    """
+    lines = dxf.read_text(encoding="utf-8", errors="surrogateescape").splitlines()
+    kept: list[str] = []
+    # A DXF is strictly (code, value) line pairs, so walk it pairwise: a bare
+    # "5" may also be the value of some other code.
+    for i in range(0, len(lines) - 1, 2):
+        if lines[i].strip() == "5" and lines[i + 1].strip() == "0":
+            continue
+        kept.extend(lines[i : i + 2])
+    if len(lines) % 2:
+        kept.append(lines[-1])
+    if len(kept) != len(lines):
+        dxf.write_text("\n".join(kept) + "\n", encoding="utf-8", errors="surrogateescape")
+
+
+def _read_dwg(path: str):
+    """Load a DWG into an ezdxf document through whichever converter is present."""
+    reader = _dwg_reader()
+    if reader == "odafc":
+        from ezdxf.addons import odafc
+
+        return odafc.readfile(path)
+    if reader != "libredwg":
+        raise UnsupportedCapabilityError(
+            "dwg",
+            f"drawing_open: cannot read '{path}': no DWG reader here. Install LibreDWG "
+            "(dwg2dxf) or the ODA File Converter, or use the live COM backend.",
+        )
+    from ezdxf import recover
+
+    with tempfile.TemporaryDirectory(prefix="acadmcp-dwg-") as tmp:
+        dxf = Path(tmp) / "in.dxf"
+        proc = _run_libredwg("dwg2dxf", ["-y", "-o", str(dxf), path])
+        if not dxf.is_file() or dxf.stat().st_size == 0:
+            raise RuntimeError(
+                f"dwg2dxf could not convert '{path}': {(proc.stderr or proc.stdout)[-400:]}"
+            )
+        _drop_null_handles(dxf)
+        doc, auditor = recover.readfile(str(dxf))
+        if auditor.has_errors:
+            log.warning("dwg2dxf output for %s needed %d repairs", path, len(auditor.errors))
+        return doc
+
+
+def _write_dwg(doc, path: str, version: str = "R2018") -> dict:
+    """Write `doc` as a real DWG; returns the writer and the version produced."""
+    writer = _dwg_writer()
+    if writer == "odafc":
+        from ezdxf.addons import odafc
+
+        odafc.export_dwg(doc, path, version=version, replace=True)
+        return {"writer": "odafc", "version": version}
+    if writer != "libredwg":
+        raise _refuse_dwg("drawing_export_dwg", path)
+    produced = version if version in LIBREDWG_WRITE_VERSIONS else "R2000"
+    with tempfile.TemporaryDirectory(prefix="acadmcp-dwg-") as tmp:
+        dxf = Path(tmp) / "out.dxf"
+        doc.saveas(str(dxf))
+        out = Path(path)
+        if out.exists():
+            out.unlink()
+        proc = _run_libredwg("dxf2dwg", ["-y", "--as", produced.lower(), "-o", str(out), str(dxf)])
+        if not out.is_file() or out.stat().st_size == 0:
+            raise RuntimeError(
+                f"dxf2dwg could not write '{path}': {(proc.stderr or proc.stdout)[-400:]}"
+            )
+    return {"writer": "libredwg", "version": produced, "requested_version": version}
 
 
 def _image_pixels(path: str) -> tuple[int, int]:
@@ -1611,7 +1732,11 @@ class EzdxfBackend(AutoCADBackend):
             features={
                 "drawing_2d": FeatureCapability(True, "native"),
                 "dxf": FeatureCapability(True, "native"),
-                "dwg": FeatureCapability(False, reason="no_dwg_writer_requires_live_autocad"),
+                "dwg": (
+                    FeatureCapability(True, _dwg_reader(), reason="converted_through_dxf")
+                    if _dwg_reader()
+                    else FeatureCapability(False, reason="no_dwg_writer_requires_live_autocad")
+                ),
                 "pdf": render_capability,
                 "png": render_capability,
                 "transactions": FeatureCapability(True, "snapshot"),
@@ -1727,6 +1852,10 @@ class EzdxfBackend(AutoCADBackend):
                 "dwg_write": (
                     FeatureCapability(True, "odafc", reason="oda_file_converter_installed")
                     if _odafc_available()
+                    else FeatureCapability(
+                        True, "libredwg", reason="libredwg_dxf2dwg;writes_r2000_or_r2004"
+                    )
+                    if _libredwg_tool("dxf2dwg")
                     else FeatureCapability(
                         False,
                         reason=(
@@ -2322,7 +2451,7 @@ class EzdxfBackend(AutoCADBackend):
                         f"DXF file exceeds MAX_DXF_BYTES limit "
                         f"({size} > {max_bytes}). Set MAX_DXF_BYTES env var to override."
                     )
-            doc = ezdxf.readfile(path)
+            doc = _read_dwg(path) if _is_dwg_path(path) else ezdxf.readfile(path)
             _normalise_dimstyle_rounding(doc)
             # R32: only reached if the read succeeded. Reopening the very path a
             # runaway doc.saveas is writing either fails loudly here (acceptable)
@@ -2357,7 +2486,7 @@ class EzdxfBackend(AutoCADBackend):
         save_path = path or self._doc_path
         # `doc.saveas` derives the format from the extension and ezdxf can only
         # write DXF, so a .dwg destination here would silently mislabel the file.
-        if save_path and _is_dwg_path(save_path):
+        if save_path and _is_dwg_path(save_path) and _dwg_writer() is None:
             raise _refuse_dwg("drawing_save", save_path)
 
         def _sync():
@@ -2365,26 +2494,38 @@ class EzdxfBackend(AutoCADBackend):
             if not save_path:
                 raise RuntimeError("No path specified and no current file path.")
             self._refuse_path_held_elsewhere("drawing_save", save_path)
-            doc.saveas(save_path)
+            result = {"ok": True, "path": save_path}
+            if _is_dwg_path(save_path):
+                result.update(_write_dwg(doc, save_path), format="dwg")
+            else:
+                doc.saveas(save_path)
             self._doc_path = save_path
             self._dirty = False
-            return {"ok": True, "path": save_path}
+            return result
 
         return await self._async(_sync)
 
     async def drawing_save_as(self, path: str, fmt: str = "dxf") -> dict:
         # The extension is authoritative (N2): a .dwg name is a DWG request even
         # when the caller passes fmt="dxf", because the bytes must match the name.
-        if fmt.lower() == "dwg" or _is_dwg_path(path):
+        want_dwg = fmt.lower() == "dwg" or _is_dwg_path(path)
+        if want_dwg and not _is_dwg_path(path):
+            # The extension stays authoritative (N2): DWG bytes need a .dwg name.
+            raise _refuse_dwg("drawing_save_as", path)
+        if want_dwg and _dwg_writer() is None:
             raise _refuse_dwg("drawing_save_as", path)
 
         def _sync():
             doc = self._require_doc()
             self._refuse_path_held_elsewhere("drawing_save_as", path)
-            doc.saveas(path)
+            if want_dwg:
+                result = {"ok": True, "path": path, "format": "dwg", **_write_dwg(doc, path)}
+            else:
+                doc.saveas(path)
+                result = {"ok": True, "path": path, "format": "dxf"}
             self._doc_path = path
             self._dirty = False
-            return {"ok": True, "path": path, "format": "dxf"}
+            return result
 
         return await self._async(_sync)
 
@@ -2579,26 +2720,25 @@ class EzdxfBackend(AutoCADBackend):
 
         if version not in DWG_VERSIONS:
             raise ValueError(f"DWG version must be one of {DWG_VERSIONS}, got {version!r}")
-        if not _odafc_available():
+        if _dwg_writer() is None:
             raise UnsupportedCapabilityError(
                 "dwg_write",
                 f"drawing_export_dwg: the {self.name} backend writes DWG only through the "
-                "ODA File Converter, which is not installed here. Install it from "
-                "https://www.opendesign.com/guestfiles/oda_file_converter and this call "
+                "ODA File Converter or LibreDWG (dxf2dwg), and neither is installed here. "
+                "Install one (https://www.opendesign.com/guestfiles/oda_file_converter, or "
+                "LibreDWG from https://www.gnu.org/software/libredwg/) and this call "
                 "starts working, or export from the com backend (a running AutoCAD seat). "
                 "drawing_export_dxf writes a DXF that AutoCAD opens unchanged.",
             )
 
         def _sync():
-            from ezdxf.addons import odafc
-
             doc = self._require_doc()
             self._refuse_path_held_elsewhere("drawing_export_dwg", path)
-            odafc.export_dwg(doc, path, version=version, replace=True)
+            written = _write_dwg(doc, path, version)
             return {
                 "ok": True,
                 "path": path,
-                "version": version,
+                **written,
                 "bytes": Path(path).stat().st_size,
                 "backend": self.name,
             }

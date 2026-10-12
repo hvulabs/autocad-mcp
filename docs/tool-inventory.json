@@ -3,7 +3,7 @@
   "schema_version": 1,
   "package_version": "1.6.0",
   "totals": {
-    "tools": 247,
+    "tools": 250,
     "resources": 8,
     "prompts": 5,
     "groups": 28
@@ -15,7 +15,7 @@
     "blocks": 9,
     "corner_ops": 4,
     "dimensions": 5,
-    "drawing": 11,
+    "drawing": 14,
     "engineering": 10,
     "entity_creation": 18,
     "entity_modification": 16,
@@ -1840,6 +1840,48 @@
         "title": "Trim Entity",
         "readOnlyHint": false,
         "destructiveHint": false
+      }
+    },
+    {
+      "name": "file_download",
+      "group": "drawing",
+      "cost": "read",
+      "summary": "Fetch a server file (DWG, DXF, PDF, PNG...) back as base64.",
+      "tags": [
+        "drawing",
+        "file"
+      ],
+      "annotations": {
+        "title": "Download File",
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "file_list",
+      "group": "drawing",
+      "cost": "read",
+      "summary": "List the drawing files in a server folder.",
+      "tags": [
+        "drawing",
+        "file"
+      ],
+      "annotations": {
+        "title": "List Files",
+        "readOnlyHint": true
+      }
+    },
+    {
+      "name": "file_upload",
+      "group": "drawing",
+      "cost": "mutate",
+      "summary": "Put a file onto the server from base64 bytes (DWG, DXF, PDF...).",
+      "tags": [
+        "drawing",
+        "file"
+      ],
+      "annotations": {
+        "title": "Upload File",
+        "readOnlyHint": false
       }
     },
     {

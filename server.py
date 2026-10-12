@@ -14,9 +14,11 @@ import argparse
 import json
 import logging
 import math
+import os
 import sys
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Annotated, Any
 
 from fastmcp import Context, FastMCP
@@ -272,6 +274,15 @@ WORKFLOW:
   5. view_screenshot            → see current state
   6. drawing_save               → save your work
 
+BULK DRAFTING (a whole sheet, hundreds of entities):
+  entity_batch_create(entities=[...], fields=["handle"], compact=True)
+                                → one call, handles only (~9 chars/entity)
+  cad_batch(steps=[...])        → mixed tools in one call (max 250 steps)
+  Never draw a sheet one entity_create_* call at a time.
+
+FILES ON A REMOTE SERVER (paths must be inside ALLOWED_PATHS):
+  file_upload / file_download / file_list move DWG, DXF, PDF, PNG in and out.
+
 ENGINEERING WORKFLOW (parts requiring real production drawings):
   1. drawing_new           → auto-bootstraps engineering layers + linetypes
   2. titleblock_apply_iso_a3 → standard ISO 7200 border + title (NEVER hand-draw the title)
@@ -471,6 +482,7 @@ SHAPED_RESULT_TOOLS = (
     "block_list",
     "entity_array_polar",
     "entity_array_rectangular",
+    "entity_batch_create",
     "entity_list",
     "entity_select_smart",
     "layer_list",
@@ -1207,7 +1219,7 @@ async def _apply_tool_profile(profile: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 1: Drawing Management (12 tools) ────────────────────────────────
+# ── SECTION 1: Drawing Management (15 tools) ────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -1328,7 +1340,8 @@ async def drawing_open(
     path: Annotated[
         str,
         "Full path to the .dxf file. .dwg needs a backend that can read it "
-        "(the live COM backend); the headless ezdxf backend refuses it.",
+        "(the live COM backend, or ezdxf with LibreDWG / the ODA File Converter "
+        "installed); otherwise it is refused.",
     ],
     ctx: Context = None,
 ) -> dict:
@@ -1412,6 +1425,156 @@ async def drawing_export_dxf(
     validated = validate_path(path, allow_write=True)
     await ctx.info(f"Exporting DXF: {validated}")
     return await _backend(ctx).drawing_export_dxf(str(validated))
+
+
+# ── File transfer: moving drawings between the client and this server ──────
+#
+# A remote server only sees its own disk, so a client whose files live
+# elsewhere (a cloud workspace, a chat upload) had no way to hand a DWG in or
+# take a PDF out. These three tools carry the bytes inside the MCP call. They
+# are confined to ALLOWED_PATHS (refused outright when it is unset, because an
+# unconfined byte reader is a file-exfiltration tool) and to drawing-related
+# extensions, and capped at MAX_TRANSFER_BYTES.
+
+FILE_TRANSFER_SUFFIXES = (
+    ".dwg",
+    ".dxf",
+    ".dwt",
+    ".pdf",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".svg",
+    ".csv",
+    ".xlsx",
+    ".json",
+)
+
+
+def _transfer_limit() -> int:
+    return int(os.environ.get("MAX_TRANSFER_BYTES", str(25 * 1024 * 1024)))
+
+
+def _transfer_path(path: str, *, tool: str, allow_write: bool) -> Path:
+    if not config.settings.allowed_paths:
+        raise ToolError(
+            f"{tool}: file transfer is disabled because ALLOWED_PATHS is not set. "
+            "Set ALLOWED_PATHS to the server's drawing folder (e.g. /data/store)."
+        )
+    validated = validate_path(path, allow_write=allow_write)
+    if validated.suffix.lower() not in FILE_TRANSFER_SUFFIXES:
+        raise ToolError(
+            f"{tool}: '{validated.name}' is not a drawing file; allowed extensions: "
+            f"{', '.join(FILE_TRANSFER_SUFFIXES)}"
+        )
+    return validated
+
+
+@cad_tool(summary="Put a file onto the server from base64 bytes (DWG, DXF, PDF...).", cost="mutate")
+@mcp.tool(
+    annotations={"title": "Upload File", "readOnlyHint": False},
+    tags={"drawing", "file"},
+)
+async def file_upload(
+    path: Annotated[str, "Destination path on the server, inside ALLOWED_PATHS"],
+    content_base64: Annotated[str, "The file's bytes, base64-encoded"],
+    gzipped: Annotated[bool, "True when the bytes were gzip-compressed before base64"] = False,
+    overwrite: Annotated[bool, "Replace an existing file"] = False,
+    ctx: Context = None,
+) -> dict:
+    """Write a file sent by the client, so drawing_open can read it.
+
+    The usual route for a drawing that lives with the client: upload the .dwg
+    or .dxf here, then drawing_open it. gzip before base64 when the client can;
+    a DXF shrinks several-fold.
+    """
+    import base64
+    import gzip
+    import hashlib
+
+    target = _transfer_path(path, tool="file_upload", allow_write=True)
+    if target.exists() and not overwrite:
+        raise ToolError(f"file_upload: {target} exists; pass overwrite=true to replace it")
+    try:
+        data = base64.b64decode(content_base64, validate=True)
+        if gzipped:
+            data = gzip.decompress(data)
+    except Exception as exc:
+        raise ToolError(f"file_upload: content is not valid base64/gzip: {exc}") from exc
+    if len(data) > _transfer_limit():
+        raise ToolError(
+            f"file_upload: {len(data)} bytes exceeds MAX_TRANSFER_BYTES ({_transfer_limit()})"
+        )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(data)
+    await ctx.info(f"Uploaded {len(data)} bytes to {target}")
+    return {
+        "ok": True,
+        "path": str(target),
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+@cad_tool(summary="Fetch a server file (DWG, DXF, PDF, PNG...) back as base64.", cost="read")
+@mcp.tool(
+    annotations={"title": "Download File", "readOnlyHint": True},
+    tags={"drawing", "file"},
+)
+async def file_download(
+    path: Annotated[str, "File on the server, inside ALLOWED_PATHS"],
+    gzip_content: Annotated[bool, "gzip the bytes before base64 (smaller for DXF/SVG/CSV)"] = True,
+    ctx: Context = None,
+) -> dict:
+    """Return a file's bytes so the client can save the DWG/PDF it just made.
+
+    Every byte crosses the conversation, so prefer the compact output: a DWG
+    or PDF of a few hundred kB is fine; tens of MB is not.
+    """
+    import base64
+    import gzip
+    import hashlib
+
+    source = _transfer_path(path, tool="file_download", allow_write=False)
+    if not source.is_file():
+        raise ToolError(f"file_download: {source} does not exist")
+    size = source.stat().st_size
+    if size > _transfer_limit():
+        raise ToolError(
+            f"file_download: {size} bytes exceeds MAX_TRANSFER_BYTES ({_transfer_limit()})"
+        )
+    data = source.read_bytes()
+    payload = gzip.compress(data, mtime=0) if gzip_content else data
+    return {
+        "path": str(source),
+        "bytes": size,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "gzipped": gzip_content,
+        "content_base64": base64.b64encode(payload).decode("ascii"),
+    }
+
+
+@cad_tool(summary="List the drawing files in a server folder.", cost="read")
+@mcp.tool(
+    annotations={"title": "List Files", "readOnlyHint": True},
+    tags={"drawing", "file"},
+)
+async def file_list(
+    folder: Annotated[str | None, "Folder inside ALLOWED_PATHS; default the first one"] = None,
+    ctx: Context = None,
+) -> dict:
+    """List drawing-related files (name, bytes, modified) in one server folder."""
+    if not config.settings.allowed_paths:
+        raise ToolError("file_list: ALLOWED_PATHS is not set, so there is no folder to list")
+    root = validate_path(folder) if folder else config.settings.allowed_paths[0]
+    if not root.is_dir():
+        raise ToolError(f"file_list: {root} is not a folder")
+    files = [
+        {"name": p.name, "bytes": p.stat().st_size, "modified": int(p.stat().st_mtime)}
+        for p in sorted(root.iterdir())
+        if p.is_file() and p.suffix.lower() in FILE_TRANSFER_SUFFIXES
+    ]
+    return {"folder": str(root), "count": len(files), "files": files}
 
 
 @cad_tool(summary="Plot the drawing, or one paper-space layout, to PDF.", cost="mutate")
@@ -4722,8 +4885,10 @@ async def cad_batch(
 async def entity_batch_create(
     entities: Annotated[
         list[dict],
-        "List of entity definitions. Each dict must have 'type' and type-specific params. Types: line, circle, arc, polyline, rectangle, text, point",
+        "List of entity definitions. Each dict must have 'type' and type-specific params. Types: line, circle, arc, polyline, text, mtext, point, hatch, spline, ellipse",
     ],
+    fields: ResultFields = None,
+    compact: ResultCompact = False,
     ctx: Context = None,
 ) -> dict:
     """Create multiple entities in a single call for better performance.
@@ -4734,6 +4899,10 @@ async def entity_batch_create(
     Denser than cad_batch for many entities of the same kind (no per-step tool
     name), and usable as one step *of* a cad_batch. Use cad_batch when the calls
     differ, must be ordered, or must feed each other.
+
+    The default answer is one full record per entity (~300 characters each).
+    For a sheet of hundreds of entities pass fields=["handle"], compact=True:
+    the handles come back as one column and the reply shrinks ~30x.
     """
     b = _backend(ctx)
     results = []
@@ -4754,8 +4923,12 @@ async def entity_batch_create(
         "ellipse": b.entity_create_ellipse,
     }
 
+    # One progress notification per entity is one wire message per entity over
+    # HTTP; a few dozen are enough to show movement on a large batch.
+    progress_every = max(1, total // 50)
     for i, ent_def in enumerate(entities):
-        await ctx.report_progress(i, total)
+        if i % progress_every == 0:
+            await ctx.report_progress(i, total)
         ent_type = ent_def.pop("type", None)
         if not ent_type:
             errors.append({"index": i, "error": "Missing 'type' key"})
@@ -4766,12 +4939,23 @@ async def entity_batch_create(
             continue
         try:
             info = await creator(**ent_def)
-            results.append(_dc(info))
+            results.append(info)
         except Exception as exc:
             errors.append({"index": i, "type": ent_type, "error": str(exc)})
 
     await ctx.report_progress(total, total)
-    return {"created": len(results), "errors": errors, "entities": results}
+    return {
+        "created": len(results),
+        "errors": errors,
+        "entities": _shape_rows(
+            results,
+            spec=EntityInfo,
+            fields=fields,
+            compact=compact,
+            tool="entity_batch_create",
+            total=len(results),
+        ),
+    }
 
 
 @cad_tool(
