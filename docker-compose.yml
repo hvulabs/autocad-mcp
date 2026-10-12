@@ -1,0 +1,21 @@
+# Chạy: docker compose up -d --build
+# Public expose do nginx sẵn có trên host đảm nhiệm (mcpdhv.space -> 127.0.0.1:8787).
+# nginx lọc theo IP (dải egress của Claude) và tự chèn Bearer token vào backend,
+# nên client không cần gửi token mà backend vẫn luôn được xác thực.
+services:
+  autocad-mcp:
+    build: { context: ., dockerfile: Dockerfile }
+    restart: unless-stopped
+    command: ["python", "server.py", "--transport", "http", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      AUTOCAD_MCP_BACKEND: ezdxf
+      DISCOVERY_MODE: search           # 2 tool thay vì ~195, tiết kiệm token
+      ALLOWED_PATHS: /data/store       # chỉ đọc/ghi trong kho file /data
+      ALLOW_REMOTE_HTTP: "true"
+      MCP_AUTH_TOKEN: ${MCP_TOKEN}
+    volumes: [cad_data:/data]
+    # chỉ bind localhost: nginx trên host proxy vào, không mở thẳng ra internet
+    ports: ["127.0.0.1:8787:8000"]
+
+volumes:
+  cad_data:

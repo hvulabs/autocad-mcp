@@ -1,0 +1,8 @@
+{$DOMAIN} {
+    # route giữ đúng thứ tự: kiểm tra token TRƯỚC khi chuyển tiếp
+    route {
+        @noauth not header Authorization "Bearer {$MCP_TOKEN}"
+        respond @noauth "Unauthorized" 401
+        reverse_proxy autocad-mcp:8000
+    }
+}
