@@ -188,11 +188,15 @@ async def test_without_a_converter_dwg_is_still_refused(client, tmp_path, monkey
         await client.call_tool("drawing_export_dwg", {"path": str(tmp_path / "x.dwg")})
 
 
-@pytest.mark.skipif(_libredwg_dir() is None, reason="LibreDWG (dxf2dwg/dwg2dxf) not installed")
+#: Read at import, before conftest pins LIBREDWG_BIN away for every test.
+_LIBREDWG = _libredwg_dir()
+
+
+@pytest.mark.skipif(_LIBREDWG is None, reason="LibreDWG (dxf2dwg/dwg2dxf) not installed")
 async def test_libredwg_writes_a_dwg_that_reopens_with_the_same_entities(
     client, tmp_path, monkeypatch
 ):
-    monkeypatch.setenv("LIBREDWG_BIN", _libredwg_dir())
+    monkeypatch.setenv("LIBREDWG_BIN", _LIBREDWG)
     monkeypatch.setattr(ezdxf_backend, "_odafc_available", lambda: False)
     await client.call_tool("entity_batch_create", {"entities": _lines(7)})
     out = tmp_path / "made.dwg"
@@ -208,3 +212,131 @@ async def test_libredwg_writes_a_dwg_that_reopens_with_the_same_entities(
     await client.call_tool("drawing_open", {"path": str(out)})
     stats = (await client.call_tool("analysis_entity_stats", {})).structured_content
     assert stats["by_type"].get("LINE") == 7
+
+
+# ---------------------------------------------------------------------------
+# Direct transfer: one-time links and server-side fetch
+# ---------------------------------------------------------------------------
+
+
+def _asgi():
+    import httpx
+
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=server.mcp.http_app()), base_url="http://srv"
+    )
+
+
+async def _link(client, path, direction, **extra):
+    return (
+        await client.call_tool(
+            "file_transfer_link", {"path": str(path), "direction": direction, **extra}
+        )
+    ).structured_content
+
+
+async def test_upload_link_takes_raw_bytes_once(client, store):
+    payload = os.urandom(50_000)
+    link = await _link(client, store / "big.dwg", "upload")
+    assert link["method"] == "PUT" and link["route"].startswith("/files/")
+    assert link["url"] is None, "in-memory transport has no HTTP origin to advertise"
+    async with _asgi() as http:
+        first = await http.put(link["route"], content=payload)
+        assert first.status_code == 200, first.text
+        assert first.json()["bytes"] == len(payload)
+        assert (store / "big.dwg").read_bytes() == payload
+        second = await http.put(link["route"], content=b"again")
+        assert second.status_code == 404, "a link is single use"
+    assert (store / "big.dwg").read_bytes() == payload
+
+
+async def test_download_link_serves_the_file(client, store):
+    (store / "out.pdf").write_bytes(b"%PDF-1.4 test")
+    link = await _link(client, store / "out.pdf", "download")
+    async with _asgi() as http:
+        wrong = await http.put(link["route"], content=b"x")
+        assert wrong.status_code == 404, "a download link cannot be used to upload"
+    link = await _link(client, store / "out.pdf", "download")
+    async with _asgi() as http:
+        got = await http.get(link["route"])
+    assert got.status_code == 200 and got.content == b"%PDF-1.4 test"
+
+
+async def test_public_base_url_makes_a_full_link(client, store, monkeypatch):
+    monkeypatch.setenv("PUBLIC_BASE_URL", "https://cad.example.org/")
+    link = await _link(client, store / "x.dxf", "upload")
+    assert link["url"] == "https://cad.example.org" + link["route"]
+
+
+async def test_links_obey_the_same_path_rules(client, store, tmp_path_factory):
+    with pytest.raises(ToolError, match="not a drawing file"):
+        await _link(client, store / "x.sh", "upload")
+    outside = tmp_path_factory.mktemp("outside") / "x.dxf"
+    with pytest.raises(ToolError):
+        await _link(client, outside, "upload")
+    (store / "kept.dxf").write_text("keep")
+    with pytest.raises(ToolError, match="overwrite"):
+        await _link(client, store / "kept.dxf", "upload")
+    with pytest.raises(ToolError, match="does not exist"):
+        await _link(client, store / "missing.pdf", "download")
+
+
+async def test_expired_link_is_refused(client, store, monkeypatch):
+    link = await _link(client, store / "late.dxf", "upload", ttl_seconds=10)
+    real = server.time.time
+    monkeypatch.setattr(server.time, "time", lambda: real() + 11)
+    async with _asgi() as http:
+        assert (await http.put(link["route"], content=b"x")).status_code == 404
+    assert not (store / "late.dxf").exists()
+
+
+async def test_upload_link_enforces_the_size_cap(client, store, monkeypatch):
+    monkeypatch.setenv("MAX_TRANSFER_BYTES", "100")
+    link = await _link(client, store / "huge.dxf", "upload")
+    async with _asgi() as http:
+        response = await http.put(link["route"], content=b"x" * 101)
+    assert response.status_code == 413
+    assert not (store / "huge.dxf").exists()
+    assert not list(store.glob(".*.part")), "no half-written file is left behind"
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["http://example.com/a.dwg", "https://127.0.0.1/a.dwg", "https://localhost/a.dwg"],
+)
+async def test_fetch_refuses_plain_http_and_private_hosts(client, store, url):
+    with pytest.raises(ToolError):
+        await client.call_tool("file_fetch_url", {"url": url, "path": str(store / "f.dwg")})
+    assert not (store / "f.dwg").exists()
+
+
+async def test_fetch_downloads_through_a_redirect(client, store, monkeypatch):
+    import httpx
+
+    payload = os.urandom(4096)
+
+    def handler(request):
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"location": "/file.dwg"})
+        return httpx.Response(200, content=payload)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+    checked = []
+    monkeypatch.setattr(server, "_refuse_private_host", checked.append)
+    result = (
+        await client.call_tool(
+            "file_fetch_url",
+            {"url": "https://files.example.org/start", "path": str(store / "f.dwg")},
+        )
+    ).structured_content
+    assert result["bytes"] == len(payload)
+    assert (store / "f.dwg").read_bytes() == payload
+    assert checked == [
+        "https://files.example.org/start",
+        "https://files.example.org/file.dwg",
+    ], "every hop is checked, not only the first URL"

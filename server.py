@@ -281,7 +281,9 @@ BULK DRAFTING (a whole sheet, hundreds of entities):
   Never draw a sheet one entity_create_* call at a time.
 
 FILES ON A REMOTE SERVER (paths must be inside ALLOWED_PATHS):
-  file_upload / file_download / file_list move DWG, DXF, PDF, PNG in and out.
+  Large files: file_transfer_link(path, "upload"|"download") gives a one-time
+  URL for curl (bytes never pass through the chat); file_fetch_url pulls from
+  a public https URL. file_upload / file_download (base64) only for small files.
 
 ENGINEERING WORKFLOW (parts requiring real production drawings):
   1. drawing_new           → auto-bootstraps engineering layers + linetypes
@@ -1219,7 +1221,7 @@ async def _apply_tool_profile(profile: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ── SECTION 1: Drawing Management (15 tools) ────────────────────────────────
+# ── SECTION 1: Drawing Management (17 tools) ────────────────────────────────
 # ---------------------------------------------------------------------------
 
 
@@ -1575,6 +1577,256 @@ async def file_list(
         if p.is_file() and p.suffix.lower() in FILE_TRANSFER_SUFFIXES
     ]
     return {"folder": str(root), "count": len(files), "files": files}
+
+
+# ── Direct transfer: the bytes skip the conversation ────────────────────────
+#
+# file_upload / file_download carry base64 inside the tool call, so every byte
+# is text the model must write or read: a 160 kB DWG is ~215k characters and
+# takes minutes. The two tools below move the bytes out of band instead.
+#
+#   file_transfer_link  hands out a one-time URL on this server's own HTTP
+#                       port. The client PUTs (or GETs) the raw file there with
+#                       curl; only the short URL passes through the model.
+#   file_fetch_url      makes the server download a file from a public https
+#                       URL itself (Drive / GitHub / any file host).
+#
+# A link is the credential: 256 random bits, single use, short-lived, bound to
+# one path and one direction, and it can only name a path _transfer_path would
+# accept anyway (ALLOWED_PATHS + drawing extensions).
+
+TRANSFER_ROUTE = "/files/"
+_TRANSFER_TICKETS: dict[str, dict] = {}
+
+
+def _prune_tickets(now: float) -> None:
+    for token in [t for t, v in _TRANSFER_TICKETS.items() if v["expires"] < now]:
+        _TRANSFER_TICKETS.pop(token, None)
+
+
+def _public_base_url() -> str | None:
+    """Where clients reach this server: PUBLIC_BASE_URL, else the request's own host."""
+    configured = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    try:
+        from fastmcp.server.dependencies import get_http_request
+
+        request = get_http_request()
+    except Exception:  # noqa: BLE001 - stdio or in-memory: there is no HTTP origin
+        return None
+    headers = request.headers
+    host = headers.get("x-forwarded-host") or headers.get("host")
+    if not host:
+        return None
+    proto = headers.get("x-forwarded-proto") or request.url.scheme
+    return f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+
+
+@cad_tool(
+    summary="Get a one-time URL to upload or download a large file with curl, outside the chat.",
+    cost="mutate",
+)
+@mcp.tool(
+    annotations={"title": "File Transfer Link", "readOnlyHint": False},
+    tags={"drawing", "file"},
+)
+async def file_transfer_link(
+    path: Annotated[str, "File on the server, inside ALLOWED_PATHS"],
+    direction: Annotated[str, "'upload' (client PUTs the file) or 'download' (client GETs it)"],
+    overwrite: Annotated[bool, "upload only: replace an existing file"] = False,
+    ttl_seconds: Annotated[int, Field(ge=10, le=3600, description="Link lifetime")] = 600,
+    ctx: Context = None,
+) -> dict:
+    """Move a large drawing without passing its bytes through the conversation.
+
+    Returns a single-use URL. Upload: `curl -fsS -T local.dwg "<url>"`.
+    Download: `curl -fsS -o local.pdf "<url>"`. Prefer this over file_upload /
+    file_download for anything over a few kB: the cost is the URL, not the file.
+    """
+    import secrets
+
+    direction = direction.strip().lower()
+    if direction not in ("upload", "download"):
+        raise ToolError("file_transfer_link: direction must be 'upload' or 'download'")
+    target = _transfer_path(path, tool="file_transfer_link", allow_write=direction == "upload")
+    if direction == "upload" and target.exists() and not overwrite:
+        raise ToolError(f"file_transfer_link: {target} exists; pass overwrite=true to replace it")
+    if direction == "download" and not target.is_file():
+        raise ToolError(f"file_transfer_link: {target} does not exist")
+    now = time.time()
+    _prune_tickets(now)
+    token = secrets.token_urlsafe(32)
+    _TRANSFER_TICKETS[token] = {
+        "path": str(target),
+        "direction": direction,
+        "expires": now + ttl_seconds,
+    }
+    route = f"{TRANSFER_ROUTE}{token}"
+    base = _public_base_url()
+    url = f"{base}{route}" if base else None
+    shown = url or f"<server base URL>{route}"
+    return {
+        "url": url,
+        "route": route,
+        "method": "PUT" if direction == "upload" else "GET",
+        "path": str(target),
+        "expires_in": ttl_seconds,
+        "single_use": True,
+        "curl": (
+            f'curl -fsS -T <local file> "{shown}"'
+            if direction == "upload"
+            else f'curl -fsS -o <local file> "{shown}"'
+        ),
+        "note": None
+        if url
+        else "No HTTP origin known here (stdio transport?). Set PUBLIC_BASE_URL.",
+    }
+
+
+@mcp.custom_route(TRANSFER_ROUTE + "{token}", methods=["PUT", "POST", "GET"])
+async def _file_transfer_route(request):
+    """The other end of file_transfer_link. The token is the only credential."""
+    import hashlib
+
+    from starlette.responses import FileResponse, JSONResponse
+
+    token = request.path_params.get("token", "")
+    now = time.time()
+    _prune_tickets(now)
+    ticket = _TRANSFER_TICKETS.get(token)
+    want = "download" if request.method == "GET" else "upload"
+    if ticket is None or ticket["direction"] != want:
+        return JSONResponse({"ok": False, "error": "unknown, used or expired link"}, 404)
+    _TRANSFER_TICKETS.pop(token, None)  # single use, spent even if the transfer fails
+    target = Path(ticket["path"])
+
+    if want == "download":
+        if not target.is_file():
+            return JSONResponse({"ok": False, "error": "file no longer exists"}, 410)
+        return FileResponse(str(target), filename=target.name)
+
+    limit = _transfer_limit()
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        return JSONResponse({"ok": False, "error": f"exceeds MAX_TRANSFER_BYTES ({limit})"}, 413)
+    partial = target.with_name(f".{target.name}.{token[:8]}.part")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with partial.open("wb") as out:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > limit:
+                    raise OverflowError
+                digest.update(chunk)
+                out.write(chunk)
+        os.replace(partial, target)
+    except OverflowError:
+        partial.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": f"exceeds MAX_TRANSFER_BYTES ({limit})"}, 413)
+    except Exception as exc:  # noqa: BLE001 - report, never leave a half file behind
+        partial.unlink(missing_ok=True)
+        return JSONResponse({"ok": False, "error": str(exc)}, 500)
+    log.info("file transfer: %d bytes -> %s", size, target)
+    return JSONResponse(
+        {"ok": True, "path": str(target), "bytes": size, "sha256": digest.hexdigest()}
+    )
+
+
+def _refuse_private_host(url: str) -> None:
+    """SSRF guard: a fetch may only reach public addresses."""
+    import ipaddress
+    import socket
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    allow_http = os.environ.get("FETCH_ALLOW_HTTP", "false").lower() == "true"
+    if parts.scheme != "https" and not (allow_http and parts.scheme == "http"):
+        raise ToolError("file_fetch_url: only https:// URLs are fetched")
+    if not parts.hostname:
+        raise ToolError("file_fetch_url: the URL names no host")
+    try:
+        infos = socket.getaddrinfo(parts.hostname, parts.port or 443, proto=socket.IPPROTO_TCP)
+    except OSError as exc:
+        raise ToolError(f"file_fetch_url: cannot resolve {parts.hostname}: {exc}") from exc
+    for info in infos:
+        address = ipaddress.ip_address(info[4][0])
+        if not address.is_global:
+            raise ToolError(
+                f"file_fetch_url: {parts.hostname} resolves to non-public {address}; refused"
+            )
+
+
+@cad_tool(summary="Make the server download a drawing from a public https URL.", cost="mutate")
+@mcp.tool(
+    annotations={"title": "Fetch File From URL", "readOnlyHint": False},
+    tags={"drawing", "file"},
+)
+async def file_fetch_url(
+    url: Annotated[str, "Public https URL of the file (direct download link)"],
+    path: Annotated[str, "Destination on the server, inside ALLOWED_PATHS"],
+    overwrite: Annotated[bool, "Replace an existing file"] = False,
+    ctx: Context = None,
+) -> dict:
+    """Pull a drawing straight from a file host, so no bytes cross the conversation.
+
+    Private and loopback addresses are refused, every redirect is re-checked,
+    and the download stops at MAX_TRANSFER_BYTES.
+    """
+    import hashlib
+    from urllib.parse import urljoin
+
+    import httpx
+
+    target = _transfer_path(path, tool="file_fetch_url", allow_write=True)
+    if target.exists() and not overwrite:
+        raise ToolError(f"file_fetch_url: {target} exists; pass overwrite=true to replace it")
+    limit = _transfer_limit()
+    partial = target.with_name(f".{target.name}.fetch.part")
+    digest = hashlib.sha256()
+    size = 0
+    current = url
+    started = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(follow_redirects=False, timeout=60) as client:
+            for _hop in range(6):
+                _refuse_private_host(current)
+                async with client.stream("GET", current) as response:
+                    if response.is_redirect:
+                        current = urljoin(current, response.headers.get("location", ""))
+                        continue
+                    if response.status_code != 200:
+                        raise ToolError(
+                            f"file_fetch_url: HTTP {response.status_code} from {current}"
+                        )
+                    with partial.open("wb") as out:
+                        async for chunk in response.aiter_bytes():
+                            size += len(chunk)
+                            if size > limit:
+                                raise ToolError(
+                                    f"file_fetch_url: larger than MAX_TRANSFER_BYTES ({limit})"
+                                )
+                            digest.update(chunk)
+                            out.write(chunk)
+                    break
+            else:
+                raise ToolError("file_fetch_url: too many redirects")
+        os.replace(partial, target)
+    except ToolError:
+        partial.unlink(missing_ok=True)
+        raise
+    except httpx.HTTPError as exc:
+        partial.unlink(missing_ok=True)
+        raise ToolError(f"file_fetch_url: download failed: {exc}") from exc
+    await ctx.info(f"Fetched {size} bytes into {target}")
+    return {
+        "ok": True,
+        "path": str(target),
+        "bytes": size,
+        "sha256": digest.hexdigest(),
+        "seconds": round(time.perf_counter() - started, 3),
+    }
 
 
 @cad_tool(summary="Plot the drawing, or one paper-space layout, to PDF.", cost="mutate")

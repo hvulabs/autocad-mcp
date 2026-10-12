@@ -20,6 +20,10 @@ def pin_headless_backend(request, monkeypatch):
     Opt out with ``@pytest.mark.live_backend`` for a test that deliberately
     exercises backend selection.
     """
+    # The suite describes the plain headless engine: no LibreDWG, so the DWG
+    # refusal tests hold on a machine (or Docker image) that has it. Tests of
+    # the LibreDWG route point LIBREDWG_BIN at the real tools themselves.
+    monkeypatch.setenv("LIBREDWG_BIN", "/nonexistent-libredwg-for-tests")
     if request.node.get_closest_marker("live_backend"):
         return
     monkeypatch.setenv("AUTOCAD_MCP_BACKEND", "ezdxf")

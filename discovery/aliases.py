@@ -530,6 +530,12 @@ TOOL_ALIASES: dict[str, ToolAliases] = {
     "file_download": ToolAliases(
         synonyms=("download file", "get file back", "retrieve output", "fetch pdf"),
     ),
+    "file_transfer_link": ToolAliases(
+        synonyms=("upload large file", "transfer link", "curl upload", "send big dwg"),
+    ),
+    "file_fetch_url": ToolAliases(
+        synonyms=("download from url", "fetch file from link", "pull drawing from web"),
+    ),
     "file_list": ToolAliases(
         synonyms=("list files", "list drawings", "what files are on the server", "dir"),
     ),

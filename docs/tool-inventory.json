@@ -3,7 +3,7 @@
   "schema_version": 1,
   "package_version": "1.6.0",
   "totals": {
-    "tools": 250,
+    "tools": 252,
     "resources": 8,
     "prompts": 5,
     "groups": 28
@@ -15,7 +15,7 @@
     "blocks": 9,
     "corner_ops": 4,
     "dimensions": 5,
-    "drawing": 14,
+    "drawing": 16,
     "engineering": 10,
     "entity_creation": 18,
     "entity_modification": 16,
@@ -1857,6 +1857,20 @@
       }
     },
     {
+      "name": "file_fetch_url",
+      "group": "drawing",
+      "cost": "mutate",
+      "summary": "Make the server download a drawing from a public https URL.",
+      "tags": [
+        "drawing",
+        "file"
+      ],
+      "annotations": {
+        "title": "Fetch File From URL",
+        "readOnlyHint": false
+      }
+    },
+    {
       "name": "file_list",
       "group": "drawing",
       "cost": "read",
@@ -1868,6 +1882,20 @@
       "annotations": {
         "title": "List Files",
         "readOnlyHint": true
+      }
+    },
+    {
+      "name": "file_transfer_link",
+      "group": "drawing",
+      "cost": "mutate",
+      "summary": "Get a one-time URL to upload or download a large file with curl, outside the chat.",
+      "tags": [
+        "drawing",
+        "file"
+      ],
+      "annotations": {
+        "title": "File Transfer Link",
+        "readOnlyHint": false
       }
     },
     {
